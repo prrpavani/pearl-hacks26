@@ -13,6 +13,7 @@ import SearchPage from "./pages/SearchPage";
 import Notifications from "./pages/Notifications";
 import Create from "./pages/Create";
 import Earn from "./pages/Earn";
+import Login from "./pages/Login";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -35,6 +36,7 @@ const App = () => (
             <Route path="/create" element={<Create />} />
             <Route path="/earn" element={<Earn />} />
           </Route>
+          <Route path="/login" element={<Login />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
