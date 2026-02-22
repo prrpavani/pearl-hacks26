@@ -4,6 +4,7 @@ export interface Task {
   task_id: string;
   image_url: string;
   options: string[];
+  ground_truth?: string; // only for labeling tasks (Earn flow)
 }
 
 export interface SubmitResult {
@@ -27,6 +28,54 @@ export const generateTask = async (): Promise<Task> => {
     throw new Error(`generate-task failed: ${err}`);
   }
   return res.json();
+};
+
+/** Fetch next labeling task: image from DB + options from Gemini 2.5 Flash (absolute image URL). */
+export const getLabelingTask = async (
+  tenantName: string = "Instagram"
+): Promise<Task> => {
+  const res = await fetch(
+    `${API}/label/next-task?tenant_name=${encodeURIComponent(tenantName)}`
+  );
+  if (!res.ok) {
+    if (res.status === 404) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail ?? "No more images to label");
+    }
+    const err = await res.text();
+    throw new Error(`label/next-task failed: ${err}`);
+  }
+  return res.json();
+};
+
+/** Submit label for the labeling workflow (vote + SOL payout). */
+export const submitLabel = async (
+  tenantName: string,
+  imageUrl: string,
+  label: string,
+  walletAddress: string
+): Promise<SubmitResult> => {
+  const form = new FormData();
+  form.append("tenant_name", tenantName);
+  form.append("image_url", imageUrl);
+  form.append("label", label);
+  form.append("wallet_address", walletAddress);
+  const res = await fetch(`${API}/label/submit`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`label/submit failed: ${err}`);
+  }
+  const data = await res.json();
+  return {
+    success: true,
+    is_correct: false, // set by caller using ground_truth
+    payout_sol: data.payout_sol ?? 0,
+    tx_signature: data.tx_signature ?? null,
+    message: "Label submitted!",
+  };
 };
 
 export const submitTask = async (

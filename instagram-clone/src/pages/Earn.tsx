@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Play, Sparkles, Loader2, CheckCircle2, XCircle, Wallet } from "lucide-react";
-import { generateTask, submitTask, fetchTipAudio } from "@/lib/api";
+import { getLabelingTask, submitLabel, fetchTipAudio } from "@/lib/api";
 import type { Task, SubmitResult } from "@/lib/api";
+
+const LABELING_TENANT = "Instagram";
 
 type Phase = "transition" | "dashboard" | "labeling";
 
@@ -69,11 +71,11 @@ const Earn = () => {
     setTask(null);
     setTaskError(null);
     try {
-      const data = await generateTask();
+      const data = await getLabelingTask(LABELING_TENANT);
       setTask(data);
     } catch (err) {
       console.error("Failed to load task:", err);
-      setTaskError("Couldn't load task — tap retry");
+      setTaskError(err instanceof Error ? err.message : "Couldn't load task — tap retry");
     } finally {
       setIsLoadingTask(false);
     }
@@ -96,11 +98,21 @@ const Earn = () => {
     if (!task || !walletAddress || isSubmitting || result) return;
     setSelectedOption(option);
     setIsSubmitting(true);
+    const groundTruth = task.ground_truth;
     try {
-      const res = await submitTask(walletAddress, task.task_id, option);
-      setResult(res);
-      if (res.is_correct) setTotalEarned((prev) => prev + res.payout_sol);
-      // Auto-advance to next task after showing result
+      const res = await submitLabel(
+        LABELING_TENANT,
+        task.task_id, // image_url path used as task_id
+        option,
+        walletAddress
+      );
+      const isCorrect = groundTruth != null && option.trim().toLowerCase() === groundTruth.trim().toLowerCase();
+      setResult({
+        ...res,
+        is_correct: isCorrect,
+        message: isCorrect ? "Correct!" : "Incorrect.",
+      });
+      setTotalEarned((prev) => prev + res.payout_sol);
       setTimeout(() => loadNextTask(), 2500);
     } catch (err) {
       console.error("Submit failed:", err);

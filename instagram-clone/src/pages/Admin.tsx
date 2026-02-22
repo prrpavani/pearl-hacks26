@@ -14,7 +14,7 @@ const Admin = () => {
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadStatus, setUploadStatus] = useState<string>("");
-  const [tenantName, setTenantName] = useState<string>("default"); // You can change default tenant
+  const [tenantName, setTenantName] = useState<string>("Instagram"); // Default to seeded tenant
 
   // Drag and drop handler
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -29,25 +29,24 @@ const Admin = () => {
       return;
     }
     setUploadStatus("Uploading...");
-    let successCount = 0;
-    for (const file of files) {
-      // Upload file to a public image host (e.g., imgur, cloudinary) or use a placeholder
-      // For demo, use a local URL
-      const imageUrl = URL.createObjectURL(file);
-      try {
-        const formData = new FormData();
-        formData.append("tenant_name", tenantName);
-        formData.append("image_url", imageUrl);
-        const res = await fetch("http://localhost:8000/tenant/upload-image", {
-          method: "POST",
-          body: formData,
-        });
-        if (res.ok) successCount++;
-      } catch (err) {
-        // Ignore error for now
+    try {
+      const formData = new FormData();
+      formData.append("tenant_name", tenantName);
+      files.forEach((file) => {
+        formData.append("files", file); // send all files in one request
+      });
+      const res = await fetch("http://localhost:8000/tenant/upload-image", {
+        method: "POST",
+        body: formData,
+      });
+      if (res.ok) {
+        setUploadStatus(`Uploaded ${files.length} of ${files.length} images.`);
+      } else {
+        setUploadStatus("Upload failed.");
       }
+    } catch (err) {
+      setUploadStatus("Upload failed.");
     }
-    setUploadStatus(`Uploaded ${successCount} of ${files.length} images.`);
     setFiles([]);
   };
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {

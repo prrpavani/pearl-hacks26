@@ -30,15 +30,19 @@ async def create_tenant(tenant_name: str, threshold: int = 5):
     await get_tenants_col().insert_one(doc)
 
 async def upload_image_to_tenant(tenant_name: str, image_url: str):
+    import logging
     image_obj = {
         "image_url": image_url,
         "votes": {},
         "verified_label": None
     }
-    await get_tenants_col().update_one(
+    result = await get_tenants_col().update_one(
         {"tenant_name": tenant_name},
         {"$push": {"uploaded_images": image_obj}}
     )
+    logging.info(f"Upload image for tenant '{tenant_name}': matched={result.matched_count}, modified={result.modified_count}, image_url={image_url}")
+    if result.matched_count == 0:
+        raise ValueError(f"Tenant '{tenant_name}' not found. No image uploaded.")
 
 async def vote_on_image(tenant_name: str, image_url: str, label: str):
     # Increment vote for label

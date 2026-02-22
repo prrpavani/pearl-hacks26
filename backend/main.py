@@ -9,11 +9,12 @@ Pearl Hacks 2026 — Backend
 import uuid
 import io
 import os
+from fastapi import UploadFile, File
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
@@ -36,7 +37,7 @@ from database import (
 )
 
 from solana_service import send_devnet_sol, PAYOUT_LAMPORTS, LAMPORTS_PER_SOL
-from ai_service import generate_image_task, get_tip_audio, get_financial_tip_text
+from ai_service import generate_image_task, get_tip_audio, get_financial_tip_text, get_label_and_wrong_options
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +60,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 async def lifespan(app: FastAPI):
     try:
         await setup_indexes()
+        # Seed the database with a tenant named 'Instagram' if it doesn't exist
+        tenants_col = get_tenants_col()
+        existing = await tenants_col.find_one({"tenant_name": "Instagram"})
+        if not existing:
+            await create_tenant("Instagram", threshold=5)
     except Exception as exc:
         import logging
         logging.warning(
@@ -72,20 +78,42 @@ async def lifespan(app: FastAPI):
 # App Initialization
 # ---------------------------------------------------------------------------
 
+from fastapi.staticfiles import StaticFiles
+
 app = FastAPI(
     title="Pearl Hacks Backend",
     version="2.0.0",
     lifespan=lifespan,
 )
 
-# CORS FIXED FOR LOCAL DEV
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8080"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: explicit origins (required when using credentials)
+_CORS_ORIGINS = [
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
+]
+
+
+async def _cors_force_middleware(request, call_next):
+    """Ensure CORS headers are on every response (including 5xx) so browser doesn't hide errors."""
+    response = await call_next(request)
+    origin = request.headers.get("origin") or ""
+    if origin in _CORS_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, PATCH, DELETE"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+
+app.add_middleware(CORSMiddleware, allow_origins=_CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
+app.middleware("http")(_cors_force_middleware)
+
+# Serve uploaded files
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +157,13 @@ class GenerateTaskResponse(BaseModel):
     options: list[str]
 
 
+class LabelTaskResponse(BaseModel):
+    task_id: str
+    image_url: str
+    options: list[str]
+    ground_truth: str
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -167,10 +202,32 @@ async def api_create_tenant(tenant_name: str = Form(...), threshold: int = Form(
     return {"status": "created", "tenant_name": tenant_name}
 
 
+
+# New: Accept file upload, save to /uploads, store static URL
+
+# Accept multiple files in a single request
+from typing import List
+
 @app.post("/tenant/upload-image")
-async def api_upload_image(tenant_name: str = Form(...), image_url: str = Form(...)):
-    await upload_image_to_tenant(tenant_name, image_url)
-    return {"status": "uploaded", "tenant_name": tenant_name, "image_url": image_url}
+async def api_upload_image(tenant_name: str = Form(...), files: List[UploadFile] = File(...)):
+    uploaded = []
+    for file in files:
+        filename = file.filename
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        # Ensure unique filename
+        base, ext = os.path.splitext(filename)
+        i = 1
+        while os.path.exists(save_path):
+            filename = f"{base}_{i}{ext}"
+            save_path = os.path.join(UPLOAD_DIR, filename)
+            i += 1
+        with open(save_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        image_url = f"/uploads/{filename}"
+        await upload_image_to_tenant(tenant_name, image_url)
+        uploaded.append(image_url)
+    return {"status": "uploaded", "tenant_name": tenant_name, "image_urls": uploaded}
 
 
 @app.get("/tenant/images")
@@ -204,6 +261,65 @@ async def api_next_image(tenant_name: str):
     return {"image_url": None}
 
 
+@app.get("/label/next-task", response_model=LabelTaskResponse)
+async def api_next_label_task(request: Request, tenant_name: str = "Instagram"):
+    """
+    Returns the next unverified image for labeling, with options from Gemini
+    (one ground truth + 3 wrong options). image_url is absolute so the frontend can load it.
+    """
+    import logging
+    import random
+
+    try:
+        tenant = await get_tenants_col().find_one({"tenant_name": tenant_name})
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        for img in tenant["uploaded_images"]:
+            if not img.get("verified_label"):
+                break
+        else:
+            raise HTTPException(status_code=404, detail="No unverified images left")
+
+        rel_url = img["image_url"]  # e.g. /uploads/foo.jpg
+        base = str(request.base_url).rstrip("/")
+        absolute_url = f"{base}{rel_url}"
+
+        filename = rel_url.replace("/uploads/", "").strip("/")
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        if not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail=f"Image file not found: {filename}")
+
+        with open(file_path, "rb") as f:
+            image_bytes = f.read()
+        mime = "image/jpeg"
+        if filename.lower().endswith(".png"):
+            mime = "image/png"
+        elif filename.lower().endswith(".webp"):
+            mime = "image/webp"
+
+        label_result = await get_label_and_wrong_options(image_bytes, mime)
+        ground_truth = label_result["ground_truth"]
+        wrong = label_result["wrong_options"]
+        options = [ground_truth] + wrong
+        random.shuffle(options)
+
+        return LabelTaskResponse(
+            task_id=rel_url,
+            image_url=absolute_url,
+            options=options,
+            ground_truth=ground_truth,
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logging.exception("Label task error")
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logging.exception("Label task error")
+        raise HTTPException(status_code=500, detail="Internal error loading task")
+
+
 @app.post("/label/submit")
 async def api_submit_label(
     tenant_name: str = Form(...),
@@ -222,6 +338,7 @@ async def api_submit_label(
         "label": label,
         "verified_label": verified_label,
         "tx_signature": tx_signature,
+        "payout_sol": PAYOUT_SOL,
     }
 
 
