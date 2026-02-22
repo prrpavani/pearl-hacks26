@@ -169,7 +169,7 @@ async def submit_task(body: TaskSubmission):
 
     is_correct = body.label.strip().lower() == task["correct_answer"].strip().lower()
 
-    # 3. Solana payout (only if correct)
+    # 3. Solana payout (only if correct; non-fatal so submission is always recorded)
     tx_sig: str | None = None
     payout_sol = 0.0
     if is_correct:
@@ -177,7 +177,8 @@ async def submit_task(body: TaskSubmission):
             tx_sig = await send_devnet_sol(body.wallet_address)
             payout_sol = PAYOUT_SOL
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Payout error: {exc}") from exc
+            import logging
+            logging.warning(f"Solana payout failed for {body.wallet_address}: {exc}")
 
     # 4. Persist submission
     try:
@@ -193,7 +194,8 @@ async def submit_task(body: TaskSubmission):
         raise HTTPException(status_code=500, detail=f"Database error: {exc}") from exc
 
     message = (
-        f"Correct! Earned {payout_sol} SOL. Tx: {tx_sig[:12]}…"
+        f"Correct! Earned {payout_sol} SOL."
+        + (f" Tx: {tx_sig[:12]}…" if tx_sig else " (payout pending)")
         if is_correct
         else "Incorrect — better luck next time!"
     )
