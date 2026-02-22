@@ -7,8 +7,11 @@ Environment variables:
     ELEVENLABS_VOICE_ID  – Voice ID to use (default: "onwK4e9ZLuTAKqWW03F9")
 """
 
-import os
 import json
+import logging
+import os
+import random
+
 import httpx
 from dotenv import load_dotenv
 import google.generativeai as genai  # type: ignore
@@ -19,7 +22,7 @@ load_dotenv()
 # Gemini setup
 # ---------------------------------------------------------------------------
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
-_gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+_gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 # ---------------------------------------------------------------------------
 # ElevenLabs setup
@@ -31,60 +34,24 @@ ELEVENLABS_TTS_URL = (
 )
 
 # ---------------------------------------------------------------------------
-# Image labeling task generation
+# Image labeling task pool — add your tasks here
+# Each entry needs: image_url, options (list of 4), correct_answer
 # ---------------------------------------------------------------------------
 
-_TASK_PROMPT = (
-    "You are generating a single image-labeling task for a crowdsourcing platform. "
-    "Pick a real, publicly accessible image URL (from Wikimedia Commons, Unsplash, or similar) "
-    "and create a simple classification question around it. "
-    "Return ONLY valid JSON with exactly these fields:\n"
-    "{\n"
-    '  "image_url": "<direct image URL>",\n'
-    '  "options": ["<choice1>", "<choice2>", "<choice3>", "<choice4>"],\n'
-    '  "correct_answer": "<one of the options>"\n'
-    "}\n"
-    "Rules:\n"
-    "- image_url must be a direct link to a publicly viewable image (jpg/png/webp).\n"
-    "- options must have exactly 4 choices.\n"
-    "- correct_answer must exactly match one of the options.\n"
-    "- Do not include any explanation or text outside the JSON."
-)
+_TASK_POOL = [
+    # ── ADD YOUR TASKS BELOW ──────────────────────────────────────────────
+    {
+        "image_url": "https://example.com/your-image.jpg",
+        "options": ["Option A", "Option B", "Option C", "Option D"],
+        "correct_answer": "Option A",
+    },
+    # ── ADD MORE TASKS ABOVE ──────────────────────────────────────────────
+]
 
 
 async def generate_image_task() -> dict:
-    """
-    Asks Gemini to produce an image-labeling task.
-    Returns a dict with keys: image_url, options, correct_answer.
-    Raises ValueError if the response cannot be parsed.
-    """
-    response = _gemini_model.generate_content(_TASK_PROMPT)
-    raw = response.text.strip()
-
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    task = json.loads(raw)
-
-    required = {"image_url", "options", "correct_answer"}
-    if not required.issubset(task.keys()):
-        raise ValueError(f"Gemini response missing required fields: {task}")
-    if not isinstance(task["options"], list) or len(task["options"]) != 4:
-        raise ValueError(f"options must be a list of 4 items, got: {task['options']}")
-    if task["correct_answer"] not in task["options"]:
-        raise ValueError(
-            f"correct_answer '{task['correct_answer']}' not in options {task['options']}"
-        )
-
-    return {
-        "image_url": task["image_url"],
-        "options": task["options"],
-        "correct_answer": task["correct_answer"],
-    }
+    """Picks a random task from the hardcoded pool."""
+    return dict(random.choice(_TASK_POOL))
 
 
 # ---------------------------------------------------------------------------
