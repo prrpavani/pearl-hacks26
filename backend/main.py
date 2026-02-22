@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
@@ -96,9 +96,20 @@ _CORS_ORIGINS = [
 
 
 async def _cors_force_middleware(request, call_next):
-    """Ensure CORS headers are on every response (including 5xx) so browser doesn't hide errors."""
+    """Ensure CORS headers are on every response (including 5xx and OPTIONS) so browser doesn't block."""
+    origin = (request.headers.get("origin") or "").strip()
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": origin if origin in _CORS_ORIGINS else _CORS_ORIGINS[0],
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS, PUT, PATCH, DELETE",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
     response = await call_next(request)
-    origin = request.headers.get("origin") or ""
     if origin in _CORS_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
@@ -262,13 +273,19 @@ async def api_next_image(tenant_name: str):
 
 
 @app.get("/label/next-task", response_model=LabelTaskResponse)
-async def api_next_label_task(request: Request, tenant_name: str = "Instagram"):
+async def api_next_label_task(
+    request: Request,
+    tenant_name: str = "Instagram",
+    exclude: str = "",
+):
     """
-    Returns the next unverified image for labeling, with options from Gemini
-    (one ground truth + 3 wrong options). image_url is absolute so the frontend can load it.
+    Returns the next unverified image for labeling (skipping any in exclude).
+    exclude: comma-separated image_url paths already answered this session (e.g. /uploads/a.jpg,/uploads/b.jpg).
     """
     import logging
     import random
+
+    exclude_set = {u.strip() for u in exclude.split(",") if u.strip()}
 
     try:
         tenant = await get_tenants_col().find_one({"tenant_name": tenant_name})
@@ -276,7 +293,7 @@ async def api_next_label_task(request: Request, tenant_name: str = "Instagram"):
             raise HTTPException(status_code=404, detail="Tenant not found")
 
         for img in tenant["uploaded_images"]:
-            if not img.get("verified_label"):
+            if not img.get("verified_label") and img["image_url"] not in exclude_set:
                 break
         else:
             raise HTTPException(status_code=404, detail="No unverified images left")
@@ -327,19 +344,23 @@ async def api_submit_label(
     label: str = Form(...),
     wallet_address: str = Form(...),
 ):
-    await vote_on_image(tenant_name, image_url, label)
-    verified_label = await verify_image_if_threshold(tenant_name, image_url)
+    import logging
 
-    tx_signature = await send_devnet_sol(wallet_address, PAYOUT_SOL)
-
-    return {
-        "status": "submitted",
-        "image_url": image_url,
-        "label": label,
-        "verified_label": verified_label,
-        "tx_signature": tx_signature,
-        "payout_sol": PAYOUT_SOL,
-    }
+    try:
+        await vote_on_image(tenant_name, image_url, label)
+        verified_label = await verify_image_if_threshold(tenant_name, image_url)
+        tx_signature = await send_devnet_sol(wallet_address, PAYOUT_SOL)
+        return {
+            "status": "submitted",
+            "image_url": image_url,
+            "label": label,
+            "verified_label": verified_label,
+            "tx_signature": tx_signature,
+            "payout_sol": PAYOUT_SOL,
+        }
+    except Exception as e:
+        logging.exception("label/submit error")
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

@@ -102,40 +102,128 @@ async def text_to_speech_bytes(text: str) -> bytes:
 # Image labeling: ground truth + 3 wrong options (Gemini 2.5 Flash vision)
 # ---------------------------------------------------------------------------
 
-LABEL_PROMPT = (
-    "Look at this image and choose a single, clear classification label (one short phrase, e.g. 'red car', 'golden retriever'). "
-    "Then invent 3 other labels that are clearly wrong but plausible-sounding (same style, wrong for this image). "
-    "Return valid JSON only, no markdown, with this exact structure: "
-    '{"ground_truth": "your one label", "wrong_options": ["wrong1", "wrong2", "wrong3"]}.'
-)
+LABEL_PROMPT = """Look at this image. Your task:
+1. Give ONE short classification label for what is shown (e.g. "black ballpoint pen", "golden retriever", "red sports car"). Put it in "ground_truth".
+2. Give exactly 3 other short labels that are WRONG for this image but sound plausible (same style). Put them in "wrong_options".
+
+Reply with ONLY a single JSON object, no other text, no markdown, no code fences. Use double quotes. Example:
+{"ground_truth": "black ballpoint pen", "wrong_options": ["wooden pencil", "blue marker", "keyboard"]}"""
+
+
+def _extract_json_text(data: dict) -> tuple[str | None, str]:
+    """
+    Get raw text from Gemini generateContent response.
+    Returns (text, debug_info). Iterates ALL parts (vision can put text in parts[1] etc.).
+    """
+    candidates = data.get("candidates") or []
+    if not candidates:
+        reason = data.get("promptFeedback", {}).get("blockReason") or "no candidates"
+        return None, f"candidates empty ({reason})"
+    c0 = candidates[0]
+    content = c0.get("content")
+    if not content:
+        return None, "candidates[0].content missing"
+    parts = content.get("parts") or []
+    if not parts:
+        finish = c0.get("finishReason")
+        return None, f"parts empty (finishReason={finish})"
+    for i, part in enumerate(parts):
+        text = (part.get("text") or part.get("content") or "").strip()
+        if text:
+            return text, f"from parts[{i}]"
+    # Some APIs return flattened text at top level
+    flat = (data.get("text") or "").strip()
+    if flat:
+        return flat, "from top-level text"
+    return None, "no part with text"
 
 
 def _parse_gemini_label_response(data: dict) -> dict:
-    """Extract JSON text from Gemini response and return ground_truth + wrong_options."""
+    """Extract JSON from Gemini response and return ground_truth + wrong_options."""
+    import re
     import json as _json
 
-    try:
-        candidates = data.get("candidates") or []
-        if not candidates:
-            return {"ground_truth": "unknown", "wrong_options": ["Option A", "Option B", "Option C"]}
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        if not parts:
-            return {"ground_truth": "unknown", "wrong_options": ["Option A", "Option B", "Option C"]}
-        text = (parts[0].get("text") or "").strip()
-        if not text:
-            return {"ground_truth": "unknown", "wrong_options": ["Option A", "Option B", "Option C"]}
-        # Strip markdown code fence if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        out = _json.loads(text)
-        ground = out.get("ground_truth") or "unknown"
-        wrong = out.get("wrong_options") or []
-        if len(wrong) < 3:
-            wrong = (wrong + ["Option A", "Option B", "Option C"])[:3]
-        return {"ground_truth": ground, "wrong_options": wrong[:3]}
-    except Exception as e:
-        logging.warning(f"Gemini response parse error: {e}")
+    text, debug = _extract_json_text(data)
+    if not text:
+        # Log structure to diagnose API shape changes
+        try:
+            cand0 = (data.get("candidates") or [None])[0]
+            parts = (cand0.get("content") or {}).get("parts", []) if isinstance(cand0, dict) else []
+            part_keys = [list(p.keys()) for p in parts[:3]] if parts else []
+            logging.warning(
+                "Gemini label response: no text (%s). candidates[0].content.parts[*].keys=%s",
+                debug,
+                part_keys,
+            )
+        except Exception:
+            pass
         return {"ground_truth": "unknown", "wrong_options": ["Option A", "Option B", "Option C"]}
+
+    # Strip markdown code block if present (```json ... ``` or ``` ... ```)
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if match:
+            text = match.group(1).strip()
+        else:
+            text = text.replace("```", "").strip()
+
+    # Find outermost {...} by brace matching
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    text = text[start : i + 1]
+                    break
+
+    try:
+        out = _json.loads(text)
+    except _json.JSONDecodeError as e:
+        # Retry after stripping trailing comma (common model mistake)
+        text_clean = re.sub(r",\s*}", "}", text)
+        text_clean = re.sub(r",\s*]", "]", text_clean)
+        try:
+            out = _json.loads(text_clean)
+        except _json.JSONDecodeError:
+            logging.warning(
+                "Gemini label JSON decode error: %s at pos %s text=%r",
+                e.msg,
+                e.pos,
+                text[:300] if text else "",
+            )
+            return {"ground_truth": "unknown", "wrong_options": ["Option A", "Option B", "Option C"]}
+
+    # Accept multiple key names (API might return camelCase or variants)
+    ground = (
+        out.get("ground_truth")
+        or out.get("groundTruth")
+        or out.get("label")
+        or out.get("correct_label")
+        or "unknown"
+    )
+    if not isinstance(ground, str):
+        ground = str(ground) if ground else "unknown"
+    ground = ground.strip() or "unknown"
+
+    wrong = (
+        out.get("wrong_options")
+        or out.get("wrongOptions")
+        or out.get("incorrect_options")
+        or out.get("options")
+        or []
+    )
+    if not isinstance(wrong, list):
+        wrong = []
+    wrong = [str(x).strip() for x in wrong if x][:3]
+    if len(wrong) < 3:
+        wrong = wrong + ["Option A", "Option B", "Option C"]
+    wrong = wrong[:3]
+
+    return {"ground_truth": ground, "wrong_options": wrong}
 
 
 async def get_label_and_wrong_options(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
@@ -165,10 +253,16 @@ async def get_label_and_wrong_options(image_bytes: bytes, mime_type: str = "imag
             "maxOutputTokens": 256,
             "responseMimeType": "application/json",
         },
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
+        ],
     }
 
-    # Try 2.5 first, then 2.0 (2.5 may not be available for all keys)
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash"):
+    # Try 2.5, then 2.0, then 1.5 (different models may return different shapes)
+    for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{url}?key={api_key}", headers=headers, json=payload)

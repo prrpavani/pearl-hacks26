@@ -16,6 +16,9 @@ const Earn = () => {
   const [task, setTask] = useState<Task | null>(null);
   const [isLoadingTask, setIsLoadingTask] = useState(false);
   const [taskError, setTaskError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [noMoreImages, setNoMoreImages] = useState(false);
+  const [completedTaskIds, setCompletedTaskIds] = useState<string[]>([]);
 
   // Submission state
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
@@ -64,18 +67,31 @@ const Earn = () => {
   // Task lifecycle
   // ---------------------------------------------------------------------------
 
-  const loadNextTask = async () => {
+  const loadNextTask = async (completedOverride?: string[]) => {
     setIsLoadingTask(true);
     setSelectedOption(null);
     setResult(null);
+    setSubmitError(null);
     setTask(null);
     setTaskError(null);
+    setNoMoreImages(false);
+    const toExclude = completedOverride ?? completedTaskIds;
+    if (completedOverride !== undefined) {
+      setCompletedTaskIds(completedOverride);
+    }
     try {
-      const data = await getLabelingTask(LABELING_TENANT);
+      const data = await getLabelingTask(LABELING_TENANT, toExclude);
       setTask(data);
     } catch (err) {
       console.error("Failed to load task:", err);
-      setTaskError(err instanceof Error ? err.message : "Couldn't load task — tap retry");
+      const msg = err instanceof Error ? err.message : "Couldn't load task — tap retry";
+      const isNoMore = /no more|no unverified|all images/i.test(msg);
+      if (isNoMore) {
+        setNoMoreImages(true);
+        setTaskError(null);
+      } else {
+        setTaskError(msg);
+      }
     } finally {
       setIsLoadingTask(false);
     }
@@ -87,6 +103,7 @@ const Earn = () => {
       return;
     }
     setPhase("labeling");
+    setCompletedTaskIds([]);
     await loadNextTask();
   };
 
@@ -97,25 +114,30 @@ const Earn = () => {
   const handleOptionClick = async (option: string) => {
     if (!task || !walletAddress || isSubmitting || result) return;
     setSelectedOption(option);
+    setSubmitError(null);
     setIsSubmitting(true);
     const groundTruth = task.ground_truth;
+    const taskIdToComplete = task.task_id;
     try {
       const res = await submitLabel(
         LABELING_TENANT,
-        task.task_id, // image_url path used as task_id
+        taskIdToComplete,
         option,
         walletAddress
       );
       const isCorrect = groundTruth != null && option.trim().toLowerCase() === groundTruth.trim().toLowerCase();
+      const payoutStr = res.payout_sol > 0 ? ` +${res.payout_sol.toFixed(3)} SOL` : "";
       setResult({
         ...res,
         is_correct: isCorrect,
-        message: isCorrect ? "Correct!" : "Incorrect.",
+        message: `Coin deposited!${payoutStr}`,
       });
       setTotalEarned((prev) => prev + res.payout_sol);
-      setTimeout(() => loadNextTask(), 2500);
+      const nextExclude = [...completedTaskIds, taskIdToComplete];
+      setTimeout(() => loadNextTask(nextExclude), 2800);
     } catch (err) {
       console.error("Submit failed:", err);
+      setSubmitError(err instanceof Error ? err.message : "Submit failed — try again");
       setIsSubmitting(false);
     }
   };
@@ -293,14 +315,38 @@ const Earn = () => {
               )}
             </div>
 
-            {/* Task Image */}
+            {/* Task Image — next image fades in when task changes */}
             <motion.div
               className="w-full max-w-sm aspect-square rounded-xl overflow-hidden border border-border flex items-center justify-center bg-ig-elevated relative"
-              initial={{ y: 20, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              transition={{ delay: 0.1, duration: 0.4 }}
+              initial={false}
+              animate={{ opacity: 1 }}
             >
-              {isLoadingTask ? (
+              {noMoreImages ? (
+                <motion.div
+                  key="all-done"
+                  className="flex flex-col items-center justify-center gap-4 p-6 text-center"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.4 }}
+                >
+                  <CheckCircle2 className="w-16 h-16 text-green-500" />
+                  <p className="text-lg font-semibold text-foreground">
+                    You've labeled all images!
+                  </p>
+                  <p className="text-2xl font-bold text-ig-orange">
+                    {totalEarned.toFixed(3)} SOL earned
+                  </p>
+                  <button
+                    onClick={() => {
+                      setNoMoreImages(false);
+                      setPhase("dashboard");
+                    }}
+                    className="px-5 py-2.5 rounded-full text-sm font-semibold bg-ig-orange text-white hover:opacity-90"
+                  >
+                    Done
+                  </button>
+                </motion.div>
+              ) : isLoadingTask ? (
                 <Loader2 className="w-8 h-8 text-muted-foreground animate-spin" />
               ) : taskError ? (
                 <div className="flex flex-col items-center gap-2 p-4 text-center">
@@ -313,10 +359,14 @@ const Earn = () => {
                   </button>
                 </div>
               ) : task ? (
-                <img
+                <motion.img
+                  key={task.task_id}
                   src={task.image_url}
                   alt="Labeling task"
                   className="w-full h-full object-cover"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.35 }}
                   onError={(e) => {
                     (e.target as HTMLImageElement).src =
                       "https://placehold.co/400x400/1a1a1a/666?text=Image+unavailable";
@@ -326,32 +376,29 @@ const Earn = () => {
                 <Loader2 className="w-8 h-8 text-muted-foreground animate-spin" />
               )}
 
-              {/* Result overlay */}
+              {/* Result overlay: coin deposited, then fades out before next image */}
               <AnimatePresence>
                 {result && (
                   <motion.div
-                    className="absolute inset-0 flex items-center justify-center"
+                    className="absolute inset-0 flex items-center justify-center z-10 bg-black/40"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
+                    transition={{ duration: 0.25 }}
                   >
                     <motion.div
-                      className={`flex flex-col items-center gap-2 rounded-2xl px-8 py-6 backdrop-blur-md ${
-                        result.is_correct
-                          ? "bg-green-950/90 border border-green-500"
-                          : "bg-red-950/90 border border-red-500"
-                      }`}
-                      initial={{ scale: 0.8 }}
-                      animate={{ scale: 1 }}
-                      exit={{ scale: 0.8 }}
+                      className="flex flex-col items-center gap-2 rounded-2xl px-8 py-6 backdrop-blur-md bg-green-950/95 border border-green-500 shadow-xl"
+                      initial={{ scale: 0.9, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      exit={{ scale: 0.95, opacity: 0 }}
+                      transition={{ duration: 0.3 }}
                     >
-                      {result.is_correct ? (
-                        <CheckCircle2 className="w-12 h-12 text-green-400" />
-                      ) : (
-                        <XCircle className="w-12 h-12 text-red-400" />
-                      )}
-                      <p className="text-white font-semibold text-center text-sm">
+                      <CheckCircle2 className="w-12 h-12 text-green-400" />
+                      <p className="text-white font-semibold text-center text-base">
                         {result.message}
+                      </p>
+                      <p className="text-green-200/90 text-sm">
+                        {result.is_correct ? "Correct!" : "Incorrect."}
                       </p>
                     </motion.div>
                   </motion.div>
@@ -359,7 +406,19 @@ const Earn = () => {
               </AnimatePresence>
             </motion.div>
 
-            {/* 2×2 Options Grid */}
+            {/* Submit error (e.g. network / backend failure) */}
+            {submitError && (
+              <motion.p
+                className="text-sm text-red-400 text-center max-w-sm"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+              >
+                {submitError}
+              </motion.p>
+            )}
+
+            {/* 2×2 Options Grid (hidden when no more images) */}
+            {!noMoreImages && (
             <motion.div
               className="grid grid-cols-2 gap-3 w-full max-w-sm"
               initial={{ y: 20, opacity: 0 }}
@@ -393,6 +452,7 @@ const Earn = () => {
                     </motion.button>
                   ))}
             </motion.div>
+            )}
 
             {/* Vaultic tip text caption */}
             {tipText && (
