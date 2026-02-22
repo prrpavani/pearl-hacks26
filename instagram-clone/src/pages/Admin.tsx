@@ -13,6 +13,8 @@ const Admin = () => {
     }, []);
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploadStatus, setUploadStatus] = useState<string>("");
+  const [tenantName, setTenantName] = useState<string>("default"); // You can change default tenant
 
   // Drag and drop handler
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -21,6 +23,33 @@ const Admin = () => {
     setFiles(droppedFiles);
   };
 
+  const handleSubmit = async () => {
+    if (!files.length) {
+      setUploadStatus("No files selected.");
+      return;
+    }
+    setUploadStatus("Uploading...");
+    let successCount = 0;
+    for (const file of files) {
+      // Upload file to a public image host (e.g., imgur, cloudinary) or use a placeholder
+      // For demo, use a local URL
+      const imageUrl = URL.createObjectURL(file);
+      try {
+        const formData = new FormData();
+        formData.append("tenant_name", tenantName);
+        formData.append("image_url", imageUrl);
+        const res = await fetch("http://localhost:8000/tenant/upload-image", {
+          method: "POST",
+          body: formData,
+        });
+        if (res.ok) successCount++;
+      } catch (err) {
+        // Ignore error for now
+      }
+    }
+    setUploadStatus(`Uploaded ${successCount} of ${files.length} images.`);
+    setFiles([]);
+  };
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFiles(Array.from(e.target.files || []));
   };
@@ -79,6 +108,23 @@ const Admin = () => {
           <div className="text-md text-[#a445ee] mt-6">
             {files.length > 0 ? `${files.length} file(s) ready to upload` : "Drag and drop or select images"}
           </div>
+          {/* Tenant name input */}
+          <input
+            type="text"
+            value={tenantName}
+            onChange={e => setTenantName(e.target.value)}
+            placeholder="Tenant name"
+            className="mt-2 px-4 py-2 rounded-xl border border-[#a445ee]"
+          />
+          {/* Submit button */}
+          <button
+            className="mt-4 px-8 py-3 rounded-xl bg-[#a445ee] text-white font-semibold text-lg shadow-md hover:scale-105 transition-transform"
+            onClick={handleSubmit}
+            disabled={files.length === 0}
+          >
+            Submit Images
+          </button>
+          <div className="mt-2 text-sm text-[#a445ee]">{uploadStatus}</div>
         </div>
       </div>
     </div>

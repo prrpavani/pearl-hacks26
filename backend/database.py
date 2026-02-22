@@ -10,6 +10,62 @@ print(MONGO_URI)
 DB_NAME = "pearlhacks"
 TASKS_COLLECTION = "tasks"
 SUBMISSIONS_COLLECTION = "task_submissions"
+TENANTS_COLLECTION = "tenants"
+VERIFIED_COLLECTION = "verified_images"
+def get_tenants_col():
+    return get_db()[TENANTS_COLLECTION]
+
+def get_verified_col():
+    return get_db()[VERIFIED_COLLECTION]
+# ---------------------------------------------------------------------------
+# Tenants & Image Upload
+# ---------------------------------------------------------------------------
+
+async def create_tenant(tenant_name: str, threshold: int = 5):
+    doc = {
+        "tenant_name": tenant_name,
+        "uploaded_images": [],
+        "threshold": threshold
+    }
+    await get_tenants_col().insert_one(doc)
+
+async def upload_image_to_tenant(tenant_name: str, image_url: str):
+    image_obj = {
+        "image_url": image_url,
+        "votes": {},
+        "verified_label": None
+    }
+    await get_tenants_col().update_one(
+        {"tenant_name": tenant_name},
+        {"$push": {"uploaded_images": image_obj}}
+    )
+
+async def vote_on_image(tenant_name: str, image_url: str, label: str):
+    # Increment vote for label
+    await get_tenants_col().update_one(
+        {"tenant_name": tenant_name, "uploaded_images.image_url": image_url},
+        {"$inc": {"uploaded_images.$.votes.%s" % label: 1}}
+    )
+
+async def verify_image_if_threshold(tenant_name: str, image_url: str):
+    tenant = await get_tenants_col().find_one({"tenant_name": tenant_name})
+    threshold = tenant.get("threshold", 5)
+    for img in tenant["uploaded_images"]:
+        if img["image_url"] == image_url:
+            votes = img["votes"]
+            total_votes = sum(votes.values())
+            if total_votes >= threshold:
+                # Find majority label
+                majority_label = max(votes, key=votes.get)
+                # Mark as verified
+                await get_tenants_col().update_one(
+                    {"tenant_name": tenant_name, "uploaded_images.image_url": image_url},
+                    {"$set": {"uploaded_images.$.verified_label": majority_label}}
+                )
+                # Move to verified collection
+                await get_verified_col().insert_one({"image_url": image_url, "label": majority_label})
+                return majority_label
+    return None
 
 TASK_TTL_MINUTES = int(os.getenv("TASK_TTL_MINUTES", "10"))
 
