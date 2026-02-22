@@ -10,8 +10,6 @@ Environment variables:
 import json
 import logging
 import os
-import random
-
 import httpx
 from dotenv import load_dotenv
 import google.generativeai as genai  # type: ignore
@@ -32,27 +30,6 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "onwK4e9ZLuTAKqWW03F9")
 ELEVENLABS_TTS_URL = (
     f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 )
-
-# ---------------------------------------------------------------------------
-# Image labeling task pool — add your tasks here
-# Each entry needs: image_url, options (list of 4), correct_answer
-# ---------------------------------------------------------------------------
-
-_TASK_POOL = [
-    # ── ADD YOUR TASKS BELOW ──────────────────────────────────────────────
-    {
-        "image_url": "https://example.com/your-image.jpg",
-        "options": ["Option A", "Option B", "Option C", "Option D"],
-        "correct_answer": "Option A",
-    },
-    # ── ADD MORE TASKS ABOVE ──────────────────────────────────────────────
-]
-
-
-async def generate_image_task() -> dict:
-    """Picks a random task from the hardcoded pool."""
-    return dict(random.choice(_TASK_POOL))
-
 
 # ---------------------------------------------------------------------------
 # Financial tip generation
@@ -250,8 +227,10 @@ async def get_label_and_wrong_options(image_bytes: bytes, mime_type: str = "imag
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 256,
-            "responseMimeType": "application/json",
+            "maxOutputTokens": 512,
+            # Note: responseMimeType "application/json" is intentionally omitted —
+            # when set, Gemini returns empty parts on MAX_TOKENS instead of text.
+            # The parser handles plain-text JSON robustly.
         },
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
@@ -261,14 +240,19 @@ async def get_label_and_wrong_options(image_bytes: bytes, mime_type: str = "imag
         ],
     }
 
-    # Try 2.5, then 2.0, then 1.5 (different models may return different shapes)
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+    # Try 2.0-flash first (most reliable for vision+JSON), then 1.5-flash fallback.
+    # Also fall through if the parsed result is the default "unknown" (model returned empty).
+    for model in ("gemini-2.0-flash", "gemini-1.5-flash"):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{url}?key={api_key}", headers=headers, json=payload)
             if resp.status_code == 200:
-                return _parse_gemini_label_response(resp.json())
-            logging.warning(f"Gemini {model} response: {resp.status_code} {resp.text[:500]}")
+                result = _parse_gemini_label_response(resp.json())
+                if result["ground_truth"] != "unknown":
+                    return result
+                logging.warning(f"Gemini {model} returned unknown label, trying next model")
+            else:
+                logging.warning(f"Gemini {model} response: {resp.status_code} {resp.text[:500]}")
 
     raise ValueError("Gemini request failed for all models")
 

@@ -6,27 +6,21 @@ Pearl Hacks 2026 — Backend
 # Imports
 # ---------------------------------------------------------------------------
 
-import uuid
 import io
 import os
 from fastapi import UploadFile, File
-import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, Response
-from pydantic import BaseModel, field_validator
+from fastapi.responses import StreamingResponse, Response
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from database import (
     setup_indexes,
     close_client,
-    create_task,
-    get_and_delete_task,
-    check_duplicate,
-    store_submission,
     get_leaderboard,
     create_tenant,
     upload_image_to_tenant,
@@ -34,10 +28,12 @@ from database import (
     verify_image_if_threshold,
     get_tenants_col,
     get_verified_col,
+    seed_static_images,
+    remove_stale_images,
 )
 
 from solana_service import send_devnet_sol, PAYOUT_LAMPORTS, LAMPORTS_PER_SOL
-from ai_service import generate_image_task, get_tip_audio, get_financial_tip_text, get_label_and_wrong_options
+from ai_service import get_tip_audio, get_financial_tip_text
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +45,6 @@ load_dotenv()
 print("SOLANA_PUBLIC_KEY:", os.getenv("SOLANA_PUBLIC_KEY"))
 
 PAYOUT_SOL = PAYOUT_LAMPORTS / LAMPORTS_PER_SOL
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
 # ---------------------------------------------------------------------------
@@ -58,18 +53,26 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import logging
     try:
         await setup_indexes()
-        # Seed the database with a tenant named 'Instagram' if it doesn't exist
+        # Ensure the 'Instagram' tenant exists
         tenants_col = get_tenants_col()
         existing = await tenants_col.find_one({"tenant_name": "Instagram"})
         if not existing:
             await create_tenant("Instagram", threshold=5)
+        # Seed hardcoded images+labels into the tenant (idempotent)
+        from static_labels import STATIC_IMAGE_LABELS
+        added = await seed_static_images("Instagram", STATIC_IMAGE_LABELS)
+        if added:
+            logging.info(f"Seeded {added} static image(s) into 'Instagram' tenant")
+        # Remove any images no longer present in uploads/
+        valid_filenames = [item["filename"] for item in STATIC_IMAGE_LABELS]
+        removed = await remove_stale_images("Instagram", valid_filenames)
+        if removed:
+            logging.info(f"Removed {removed} stale image(s) from 'Instagram' tenant")
     except Exception as exc:
-        import logging
-        logging.warning(
-            f"MongoDB index setup failed (will retry on first request): {exc}"
-        )
+        logging.warning(f"Startup setup failed: {exc}")
     yield
     await close_client()
 
@@ -130,43 +133,6 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
-
-class TaskSubmission(BaseModel):
-    wallet_address: str
-    task_id: str
-    label: str
-
-    @field_validator("wallet_address")
-    @classmethod
-    def wallet_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("wallet_address must not be empty")
-        return v
-
-    @field_validator("task_id", "label")
-    @classmethod
-    def not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("field must not be empty")
-        return v
-
-
-class TaskResponse(BaseModel):
-    success: bool
-    submission_id: str
-    is_correct: bool
-    payout_sol: float
-    tx_signature: str | None
-    message: str
-
-
-class GenerateTaskResponse(BaseModel):
-    task_id: str
-    image_url: str
-    options: list[str]
-
 
 class LabelTaskResponse(BaseModel):
     task_id: str
@@ -307,17 +273,15 @@ async def api_next_label_task(
         if not os.path.isfile(file_path):
             raise HTTPException(status_code=404, detail=f"Image file not found: {filename}")
 
-        with open(file_path, "rb") as f:
-            image_bytes = f.read()
-        mime = "image/jpeg"
-        if filename.lower().endswith(".png"):
-            mime = "image/png"
-        elif filename.lower().endswith(".webp"):
-            mime = "image/webp"
+        # Labels must be pre-stored via static_labels.py — no Gemini fallback.
+        if not img.get("ground_truth") or not img.get("wrong_options"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"No labels configured for image: {filename}. Add it to static_labels.py and restart.",
+            )
+        ground_truth = img["ground_truth"]
+        wrong = img["wrong_options"]
 
-        label_result = await get_label_and_wrong_options(image_bytes, mime)
-        ground_truth = label_result["ground_truth"]
-        wrong = label_result["wrong_options"]
         options = [ground_truth] + wrong
         random.shuffle(options)
 
@@ -349,7 +313,7 @@ async def api_submit_label(
     try:
         await vote_on_image(tenant_name, image_url, label)
         verified_label = await verify_image_if_threshold(tenant_name, image_url)
-        tx_signature = await send_devnet_sol(wallet_address, PAYOUT_SOL)
+        tx_signature = await send_devnet_sol(wallet_address)
         return {
             "status": "submitted",
             "image_url": image_url,
@@ -361,104 +325,6 @@ async def api_submit_label(
     except Exception as e:
         logging.exception("label/submit error")
         raise HTTPException(status_code=502, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Gemini Options
-# ---------------------------------------------------------------------------
-
-@app.post("/label/options")
-async def api_generate_options(image_url: str = Form(...)):
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}"}
-    gemini_url = (
-        "https://generativelanguage.googleapis.com/v1/models/"
-        "gemini-1.5-pro-latest:generateContent"
-    )
-
-    prompt = (
-        f"Classify this image and provide the ground truth label, "
-        f"plus 3 plausible but incorrect options. "
-        f"Return as JSON: "
-        f"{{'ground_truth': 'cat', "
-        f"'options': ['cat', 'dog', 'frog', 'car']}}. "
-        f"Image URL: {image_url}"
-    )
-
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(gemini_url, headers=headers, json=data)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=resp.text)
-
-        result = resp.json()
-        import json
-        text = result["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
-
-
-# ---------------------------------------------------------------------------
-# Task Generation
-# ---------------------------------------------------------------------------
-
-@app.post("/generate-task", response_model=GenerateTaskResponse)
-async def generate_task():
-    task_data = await generate_image_task()
-
-    task_id = str(uuid.uuid4())
-
-    await create_task(
-        task_id=task_id,
-        image_url=task_data["image_url"],
-        options=task_data["options"],
-        correct_answer=task_data["correct_answer"],
-    )
-
-    return GenerateTaskResponse(
-        task_id=task_id,
-        image_url=task_data["image_url"],
-        options=task_data["options"],
-    )
-
-
-@app.post("/submit-task", response_model=TaskResponse)
-async def submit_task(body: TaskSubmission):
-    if await check_duplicate(body.wallet_address, body.task_id):
-        raise HTTPException(status_code=409, detail="Already submitted.")
-
-    task = await get_and_delete_task(body.task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task expired.")
-
-    is_correct = body.label.strip().lower() == task["correct_answer"].strip().lower()
-
-    tx_sig = None
-    payout_sol = 0.0
-
-    if is_correct:
-        try:
-            tx_sig = await send_devnet_sol(body.wallet_address)
-            payout_sol = PAYOUT_SOL
-        except Exception:
-            pass
-
-    submission_id = await store_submission(
-        wallet_address=body.wallet_address,
-        task_id=body.task_id,
-        label=body.label,
-        is_correct=is_correct,
-        payout_sol=payout_sol,
-        tx_signature=tx_sig,
-    )
-
-    return TaskResponse(
-        success=True,
-        submission_id=submission_id,
-        is_correct=is_correct,
-        payout_sol=payout_sol,
-        tx_signature=tx_sig,
-        message="Correct!" if is_correct else "Incorrect.",
-    )
 
 
 @app.get("/leaderboard")

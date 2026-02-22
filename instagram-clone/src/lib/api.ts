@@ -21,21 +21,16 @@ export interface LeaderboardEntry {
   tasks_completed: number;
 }
 
-export const generateTask = async (): Promise<Task> => {
-  const res = await fetch(`${API}/generate-task`, { method: "POST" });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`generate-task failed: ${err}`);
-  }
-  return res.json();
-};
-
 /** Fetch next labeling task: image from DB + options from Gemini 2.5 Flash (absolute image URL). */
 export const getLabelingTask = async (
-  tenantName: string = "Instagram"
+  tenantName: string = "Instagram",
+  excludeUrls: string[] = []
 ): Promise<Task> => {
+  const excludeParam = excludeUrls.length
+    ? `&exclude=${encodeURIComponent(excludeUrls.join(","))}`
+    : "";
   const res = await fetch(
-    `${API}/label/next-task?tenant_name=${encodeURIComponent(tenantName)}`
+    `${API}/label/next-task?tenant_name=${encodeURIComponent(tenantName)}${excludeParam}`
   );
   if (!res.ok) {
     if (res.status === 404) {
@@ -76,23 +71,6 @@ export const submitLabel = async (
     tx_signature: data.tx_signature ?? null,
     message: "Label submitted!",
   };
-};
-
-export const submitTask = async (
-  wallet_address: string,
-  task_id: string,
-  label: string
-): Promise<SubmitResult> => {
-  const res = await fetch(`${API}/submit-task`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ wallet_address, task_id, label }),
-  });
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`submit-task failed: ${err}`);
-  }
-  return res.json();
 };
 
 export const fetchTipAudio = async (): Promise<{ tipText: string; audioUrl: string }> => {
