@@ -1,8 +1,16 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 
 const Admin = () => {
-  // Static SOL balance
-  const solBalance = "12.34 SOL";
+  // Real SOL balance
+  const [solBalance, setSolBalance] = useState<string>("...");
+    useEffect(() => {
+      fetch("http://localhost:8000/sol-balance")
+        .then(res => res.json())
+        .then(data => {
+          setSolBalance(`${data.balance} SOL`);
+        })
+        .catch(() => setSolBalance("Error fetching balance"));
+    }, []);
   const [files, setFiles] = useState<File[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
