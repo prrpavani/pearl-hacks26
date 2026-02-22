@@ -1,9 +1,10 @@
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 
 const Admin = () => {
   // Static SOL balance
   const solBalance = "12.34 SOL";
   const [files, setFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag and drop handler
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -14,6 +15,12 @@ const Admin = () => {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFiles(Array.from(e.target.files || []));
+  };
+
+  const handleUploadClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
   };
 
   return (
@@ -41,26 +48,26 @@ const Admin = () => {
             <circle cx="48" cy="40" r="4" fill="#a445ee" fillOpacity="0.15" />
           </svg>
           {/* Upload button */}
-          <label htmlFor="file-upload" className="mt-2">
-            <button
-              className="px-10 py-4 rounded-2xl bg-gradient-to-r from-[#a445ee] to-[#f58529] text-white font-semibold text-xl shadow-md flex items-center gap-2 hover:scale-105 transition-transform"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="white" strokeWidth="2" viewBox="0 0 24 24">
-                <path d="M12 17V7" strokeLinecap="round" />
-                <path d="M8 11l4-4 4 4" strokeLinecap="round" />
-                <rect x="4" y="17" width="16" height="2" rx="1" fill="white" />
-              </svg>
-              Upload
-            </button>
-            <input
-              id="file-upload"
-              type="file"
-              accept="image/*"
-              multiple
-              className="hidden"
-              onChange={handleFileChange}
-            />
-          </label>
+          <button
+            className="px-10 py-4 rounded-2xl bg-gradient-to-r from-[#a445ee] to-[#f58529] text-white font-semibold text-xl shadow-md flex items-center gap-2 hover:scale-105 transition-transform mt-2"
+            onClick={handleUploadClick}
+          >
+            <svg className="w-6 h-6" fill="none" stroke="white" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M12 17V7" strokeLinecap="round" />
+              <path d="M8 11l4-4 4 4" strokeLinecap="round" />
+              <rect x="4" y="17" width="16" height="2" rx="1" fill="white" />
+            </svg>
+            Upload
+          </button>
+          <input
+            ref={fileInputRef}
+            id="file-upload"
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={handleFileChange}
+          />
           <div className="text-md text-[#a445ee] mt-6">
             {files.length > 0 ? `${files.length} file(s) ready to upload` : "Drag and drop or select images"}
           </div>
