@@ -23,6 +23,7 @@ from solders.transaction import Transaction  # type: ignore
 from solders.message import Message  # type: ignore
 from solana.rpc.async_api import AsyncClient  # type: ignore
 from solana.rpc.commitment import Confirmed  # type: ignore
+from solana.rpc.types import TxOpts  # type: ignore
 
 load_dotenv()
 
@@ -73,14 +74,14 @@ async def send_devnet_sol(recipient_address: str) -> str:
         )
         tx = Transaction([master], msg, recent_blockhash)
 
-        # Send and confirm
-        resp = await client.send_transaction(tx)
-        sig = str(resp.value)
+        # Send and confirm (skip_preflight avoids BlockhashNotFound on Devnet)
+        resp = await client.send_transaction(tx, opts=TxOpts(skip_preflight=True))
+        sig = resp.value  # Signature object — keep as-is for confirm_transaction
 
         # Wait for confirmation (non-blocking poll)
         await client.confirm_transaction(sig, commitment=Confirmed)
 
-    return sig
+    return str(sig)
 
 
 # ---------------------------------------------------------------------------
