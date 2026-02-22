@@ -4,6 +4,7 @@ export interface Task {
   task_id: string;
   image_url: string;
   options: string[];
+  ground_truth?: string; // only for labeling tasks (Earn flow)
 }
 
 export interface SubmitResult {
@@ -20,30 +21,56 @@ export interface LeaderboardEntry {
   tasks_completed: number;
 }
 
-export const generateTask = async (): Promise<Task> => {
-  const res = await fetch(`${API}/generate-task`, { method: "POST" });
+/** Fetch next labeling task: image from DB + options from Gemini 2.5 Flash (absolute image URL). */
+export const getLabelingTask = async (
+  tenantName: string = "Instagram",
+  excludeUrls: string[] = []
+): Promise<Task> => {
+  const excludeParam = excludeUrls.length
+    ? `&exclude=${encodeURIComponent(excludeUrls.join(","))}`
+    : "";
+  const res = await fetch(
+    `${API}/label/next-task?tenant_name=${encodeURIComponent(tenantName)}${excludeParam}`
+  );
   if (!res.ok) {
+    if (res.status === 404) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.detail ?? "No more images to label");
+    }
     const err = await res.text();
-    throw new Error(`generate-task failed: ${err}`);
+    throw new Error(`label/next-task failed: ${err}`);
   }
   return res.json();
 };
 
-export const submitTask = async (
-  wallet_address: string,
-  task_id: string,
-  label: string
+/** Submit label for the labeling workflow (vote + SOL payout). */
+export const submitLabel = async (
+  tenantName: string,
+  imageUrl: string,
+  label: string,
+  walletAddress: string
 ): Promise<SubmitResult> => {
-  const res = await fetch(`${API}/submit-task`, {
+  const form = new FormData();
+  form.append("tenant_name", tenantName);
+  form.append("image_url", imageUrl);
+  form.append("label", label);
+  form.append("wallet_address", walletAddress);
+  const res = await fetch(`${API}/label/submit`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ wallet_address, task_id, label }),
+    body: form,
   });
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`submit-task failed: ${err}`);
+    throw new Error(`label/submit failed: ${err}`);
   }
-  return res.json();
+  const data = await res.json();
+  return {
+    success: true,
+    is_correct: false, // set by caller using ground_truth
+    payout_sol: data.payout_sol ?? 0,
+    tx_signature: data.tx_signature ?? null,
+    message: "Label submitted!",
+  };
 };
 
 export const fetchTipAudio = async (): Promise<{ tipText: string; audioUrl: string }> => {

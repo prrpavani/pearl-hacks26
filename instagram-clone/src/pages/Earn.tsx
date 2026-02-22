@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Play, Sparkles, Loader2, CheckCircle2, XCircle, Wallet } from "lucide-react";
-import { generateTask, submitTask, fetchTipAudio } from "@/lib/api";
+import { Play, Sparkles, Loader2, CheckCircle2, Wallet, ArrowDown, TrendingUp, Zap } from "lucide-react";
+import { getLabelingTask, submitLabel } from "@/lib/api";
 import type { Task, SubmitResult } from "@/lib/api";
 
+const LABELING_TENANT = "Instagram";
+
 type Phase = "transition" | "dashboard" | "labeling";
+type FinancialPhase = "task" | "financial-choice" | "financial-result";
 
 const Earn = () => {
   const [phase, setPhase] = useState<Phase>("transition");
@@ -14,19 +17,25 @@ const Earn = () => {
   const [task, setTask] = useState<Task | null>(null);
   const [isLoadingTask, setIsLoadingTask] = useState(false);
   const [taskError, setTaskError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [noMoreImages, setNoMoreImages] = useState(false);
+  const [completedTaskIds, setCompletedTaskIds] = useState<string[]>([]);
 
   // Submission state
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [result, setResult] = useState<SubmitResult | null>(null);
 
-  // Session earnings
+  // Session earnings & portfolio
   const [totalEarned, setTotalEarned] = useState(0);
+  const [availableSOL, setAvailableSOL] = useState(0);
+  const [investedSOL, setInvestedSOL] = useState(0);
+  const [lastCoinSOL, setLastCoinSOL] = useState(0);
 
-  // Tip (Vaultic / Jarvis)
-  const [tipText, setTipText] = useState<string | null>(null);
-  const [isTipLoading, setIsTipLoading] = useState(false);
-  const audioUrlRef = useRef<string | null>(null);
+  // Financial literacy flow
+  const [financialPhase, setFinancialPhase] = useState<FinancialPhase>("task");
+  const [financialChoiceMessage, setFinancialChoiceMessage] = useState<string | null>(null);
+  const pendingExcludeRef = useRef<string[]>([]);
 
   // Auto-advance from transition → dashboard
   useEffect(() => {
@@ -62,18 +71,33 @@ const Earn = () => {
   // Task lifecycle
   // ---------------------------------------------------------------------------
 
-  const loadNextTask = async () => {
+  const loadNextTask = async (completedOverride?: string[]) => {
     setIsLoadingTask(true);
+    setIsSubmitting(false);
     setSelectedOption(null);
     setResult(null);
+    setSubmitError(null);
     setTask(null);
     setTaskError(null);
+    setNoMoreImages(false);
+    setFinancialPhase("task");
+    const toExclude = completedOverride ?? completedTaskIds;
+    if (completedOverride !== undefined) {
+      setCompletedTaskIds(completedOverride);
+    }
     try {
-      const data = await generateTask();
+      const data = await getLabelingTask(LABELING_TENANT, toExclude);
       setTask(data);
     } catch (err) {
       console.error("Failed to load task:", err);
-      setTaskError("Couldn't load task — tap retry");
+      const msg = err instanceof Error ? err.message : "Couldn't load task — tap retry";
+      const isNoMore = /no more|no unverified|all images/i.test(msg);
+      if (isNoMore) {
+        setNoMoreImages(true);
+        setTaskError(null);
+      } else {
+        setTaskError(msg);
+      }
     } finally {
       setIsLoadingTask(false);
     }
@@ -85,7 +109,10 @@ const Earn = () => {
       return;
     }
     setPhase("labeling");
-    await loadNextTask();
+    setTotalEarned(0);
+    setAvailableSOL(0);
+    setInvestedSOL(0);
+    await loadNextTask([]);
   };
 
   // ---------------------------------------------------------------------------
@@ -95,45 +122,75 @@ const Earn = () => {
   const handleOptionClick = async (option: string) => {
     if (!task || !walletAddress || isSubmitting || result) return;
     setSelectedOption(option);
+    setSubmitError(null);
     setIsSubmitting(true);
+    const groundTruth = task.ground_truth;
+    // task.task_id == relative image URL ("/uploads/foo.jpg") which is what
+    // the backend stores in MongoDB — intentionally passed as imageUrl here.
+    const taskIdToComplete = task.task_id;
     try {
-      const res = await submitTask(walletAddress, task.task_id, option);
-      setResult(res);
-      if (res.is_correct) setTotalEarned((prev) => prev + res.payout_sol);
-      // Auto-advance to next task after showing result
-      setTimeout(() => loadNextTask(), 2500);
+      const res = await submitLabel(
+        LABELING_TENANT,
+        taskIdToComplete,
+        option,
+        walletAddress
+      );
+      const isCorrect = groundTruth != null && option.trim().toLowerCase() === groundTruth.trim().toLowerCase();
+      const payoutStr = res.payout_sol > 0 ? ` +${res.payout_sol.toFixed(3)} SOL` : "";
+      setResult({
+        ...res,
+        is_correct: isCorrect,
+        message: `Coin deposited!${payoutStr}`,
+      });
+      setTotalEarned((prev) => prev + res.payout_sol);
+      setAvailableSOL((prev) => prev + res.payout_sol);
+      setLastCoinSOL(res.payout_sol);
+      pendingExcludeRef.current = [...completedTaskIds, taskIdToComplete];
+      // Show "coin deposited" overlay briefly, then open financial choice menu
+      setTimeout(() => {
+        setResult(null);
+        setFinancialPhase("financial-choice");
+      }, 1500);
     } catch (err) {
       console.error("Submit failed:", err);
+      setSubmitError(err instanceof Error ? err.message : "Submit failed — try again");
       setIsSubmitting(false);
     }
   };
 
   // ---------------------------------------------------------------------------
-  // Vaultic tip (Gemini + ElevenLabs)
+  // Financial literacy decision handler
   // ---------------------------------------------------------------------------
 
-  const handleAskVaultic = async () => {
-    if (isTipLoading) return;
-    setIsTipLoading(true);
-    try {
-      const { tipText: text, audioUrl } = await fetchTipAudio();
-      setTipText(text);
-      // Clean up previous blob URL
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-      audioUrlRef.current = audioUrl;
-      const audio = new Audio(audioUrl);
-      audio.play();
-      audio.onended = () => {
-        if (audioUrlRef.current) {
-          URL.revokeObjectURL(audioUrlRef.current);
-          audioUrlRef.current = null;
-        }
-      };
-    } catch (err) {
-      console.error("Tip fetch failed:", err);
-    } finally {
-      setIsTipLoading(false);
+  const getFinancialMessage = (choice: string, amount: number): string => {
+    const amt = amount.toFixed(3);
+    const msgs: Record<string, string> = {
+      "do-nothing": `You're HODLing your ${amt} SOL! 📊 "HODL" started as a typo and became a crypto strategy. SOL went from ~$1 to $260 in 2021 — people who held through the dips made life-changing gains. Staying patient while others panic is one of the hardest (and most profitable) skills in investing.`,
+      withdraw: `You withdrew ${amt} SOL to your Phantom wallet. 💸 Taking profits is always valid! Just know that in crypto, frequent small withdrawals often mean missing big runs. Most experienced investors keep a core position long-term and only withdraw what they actually need — that way the rest keeps compounding.`,
+      "low-risk": `You put ${amt} SOL into a stablecoin yield pool! 📈 Protocols like Aave or Compound let you earn 4–8% APY on USDC. Unlike volatile crypto, stablecoins hold their value while your balance quietly grows — think of it as a high-yield savings account that actually pays you back. Great for building your first financial cushion.`,
+      "high-risk": `You staked ${amt} SOL in DeFi! ⚡ Liquid staking protocols like Marinade or Jito earn 7–12% APY by validating Solana transactions. But high APY = high risk: smart contract exploits, market crashes, and liquidity crunches are all real. The golden rule: never put in more than you could stomach losing entirely.`,
+    };
+    return msgs[choice] ?? "";
+  };
+
+  const handleFinancialChoice = (
+    choice: "do-nothing" | "withdraw" | "low-risk" | "high-risk"
+  ) => {
+    if (choice === "withdraw") {
+      setAvailableSOL((prev) => prev - lastCoinSOL);
+    } else if (choice === "low-risk" || choice === "high-risk") {
+      setAvailableSOL((prev) => prev - lastCoinSOL);
+      setInvestedSOL((prev) => prev + lastCoinSOL);
     }
+    // "do-nothing" leaves availableSOL unchanged
+    setFinancialChoiceMessage(getFinancialMessage(choice, lastCoinSOL));
+    setFinancialPhase("financial-result");
+  };
+
+  const handleCloseFinancialResult = () => {
+    setFinancialPhase("task");
+    setFinancialChoiceMessage(null);
+    loadNextTask(pendingExcludeRef.current);
   };
 
   // ---------------------------------------------------------------------------
@@ -265,30 +322,78 @@ const Earn = () => {
         {phase === "labeling" && (
           <motion.div
             key="labeling"
-            className="flex flex-col items-center justify-center min-h-screen px-5 py-12 gap-6"
+            className="relative flex flex-col items-center justify-center min-h-screen px-5 py-12 gap-6"
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.4 }}
           >
-            {/* Session earnings tracker */}
-            <div className="text-xs text-muted-foreground font-mono">
-              Session:{" "}
-              <span className="text-ig-orange font-semibold">
-                {totalEarned.toFixed(3)} SOL
-              </span>
-              {walletAddress && (
-                <span className="ml-2 opacity-50">({truncatedAddress})</span>
-              )}
+            {/* Session portfolio tracker */}
+            <div className="flex flex-col items-center text-xs text-muted-foreground font-mono gap-0.5">
+              <div>
+                Wallet:{" "}
+                <span className="text-ig-orange font-semibold">{availableSOL.toFixed(3)} SOL</span>
+                {investedSOL > 0 && (
+                  <>
+                    {" · "}Invested:{" "}
+                    <span className="text-green-400 font-semibold">{investedSOL.toFixed(3)} SOL</span>
+                  </>
+                )}
+              </div>
+              {walletAddress && <span className="opacity-50">{truncatedAddress}</span>}
             </div>
 
-            {/* Task Image */}
+            {/* Task Image — next image fades in when task changes */}
             <motion.div
               className="w-full max-w-sm aspect-square rounded-xl overflow-hidden border border-border flex items-center justify-center bg-ig-elevated relative"
-              initial={{ y: 20, opacity: 0 }}
-              animate={{ y: 0, opacity: 1 }}
-              transition={{ delay: 0.1, duration: 0.4 }}
+              initial={false}
+              animate={{ opacity: 1 }}
             >
-              {isLoadingTask ? (
+              {noMoreImages ? (
+                <motion.div
+                  key="all-done"
+                  className="flex flex-col items-center justify-center gap-4 p-6 text-center"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.4 }}
+                >
+                  <CheckCircle2 className="w-16 h-16 text-green-500" />
+                  <p className="text-lg font-semibold text-foreground">
+                    You've labeled all images!
+                  </p>
+                  <div className="text-sm font-mono space-y-0.5 text-center">
+                    <p className="text-2xl font-bold text-ig-orange mb-2">
+                      {totalEarned.toFixed(3)} SOL earned
+                    </p>
+                    <p className="text-muted-foreground">
+                      In wallet:{" "}
+                      <span className="text-ig-orange font-semibold">{availableSOL.toFixed(3)} SOL</span>
+                    </p>
+                    {investedSOL > 0 && (
+                      <p className="text-muted-foreground">
+                        Invested:{" "}
+                        <span className="text-green-400 font-semibold">{investedSOL.toFixed(3)} SOL</span>
+                      </p>
+                    )}
+                    {(totalEarned - availableSOL - investedSOL) > 0.00001 && (
+                      <p className="text-muted-foreground">
+                        Withdrawn:{" "}
+                        <span className="font-semibold">
+                          {(totalEarned - availableSOL - investedSOL).toFixed(3)} SOL
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => {
+                      setNoMoreImages(false);
+                      setPhase("dashboard");
+                    }}
+                    className="px-5 py-2.5 rounded-full text-sm font-semibold bg-ig-orange text-white hover:opacity-90"
+                  >
+                    Done
+                  </button>
+                </motion.div>
+              ) : isLoadingTask ? (
                 <Loader2 className="w-8 h-8 text-muted-foreground animate-spin" />
               ) : taskError ? (
                 <div className="flex flex-col items-center gap-2 p-4 text-center">
@@ -301,10 +406,14 @@ const Earn = () => {
                   </button>
                 </div>
               ) : task ? (
-                <img
+                <motion.img
+                  key={task.task_id}
                   src={task.image_url}
                   alt="Labeling task"
                   className="w-full h-full object-cover"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.35 }}
                   onError={(e) => {
                     (e.target as HTMLImageElement).src =
                       "https://placehold.co/400x400/1a1a1a/666?text=Image+unavailable";
@@ -314,31 +423,25 @@ const Earn = () => {
                 <Loader2 className="w-8 h-8 text-muted-foreground animate-spin" />
               )}
 
-              {/* Result overlay */}
+              {/* Result overlay: coin deposited, then fades out before next image */}
               <AnimatePresence>
                 {result && (
                   <motion.div
-                    className="absolute inset-0 flex items-center justify-center"
+                    className="absolute inset-0 flex items-center justify-center z-10 bg-black/40"
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
+                    transition={{ duration: 0.25 }}
                   >
                     <motion.div
-                      className={`flex flex-col items-center gap-2 rounded-2xl px-8 py-6 backdrop-blur-md ${
-                        result.is_correct
-                          ? "bg-green-950/90 border border-green-500"
-                          : "bg-red-950/90 border border-red-500"
-                      }`}
-                      initial={{ scale: 0.8 }}
-                      animate={{ scale: 1 }}
-                      exit={{ scale: 0.8 }}
+                      className="flex flex-col items-center gap-2 rounded-2xl px-8 py-6 backdrop-blur-md bg-green-950/95 border border-green-500 shadow-xl"
+                      initial={{ scale: 0.9, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      exit={{ scale: 0.95, opacity: 0 }}
+                      transition={{ duration: 0.3 }}
                     >
-                      {result.is_correct ? (
-                        <CheckCircle2 className="w-12 h-12 text-green-400" />
-                      ) : (
-                        <XCircle className="w-12 h-12 text-red-400" />
-                      )}
-                      <p className="text-white font-semibold text-center text-sm">
+                      <CheckCircle2 className="w-12 h-12 text-green-400" />
+                      <p className="text-white font-semibold text-center text-base">
                         {result.message}
                       </p>
                     </motion.div>
@@ -347,7 +450,19 @@ const Earn = () => {
               </AnimatePresence>
             </motion.div>
 
-            {/* 2×2 Options Grid */}
+            {/* Submit error (e.g. network / backend failure) */}
+            {submitError && (
+              <motion.p
+                className="text-sm text-red-400 text-center max-w-sm"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+              >
+                {submitError}
+              </motion.p>
+            )}
+
+            {/* 2×2 Options Grid (hidden when no more images) */}
+            {!noMoreImages && (
             <motion.div
               className="grid grid-cols-2 gap-3 w-full max-w-sm"
               initial={{ y: 20, opacity: 0 }}
@@ -381,36 +496,142 @@ const Earn = () => {
                     </motion.button>
                   ))}
             </motion.div>
-
-            {/* Vaultic tip text caption */}
-            {tipText && (
-              <motion.p
-                className="text-xs text-muted-foreground text-center max-w-sm italic px-2"
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-              >
-                "{tipText}"
-              </motion.p>
             )}
 
-            {/* Ask Vaultic button */}
-            <motion.button
-              onClick={handleAskVaultic}
-              disabled={isTipLoading}
-              className="flex items-center gap-2 px-4 py-2 rounded-full text-xs font-medium text-muted-foreground bg-ig-elevated border border-border hover:border-ig-purple hover:text-foreground transition-colors self-end max-w-sm w-full justify-center sm:justify-end sm:w-auto disabled:opacity-50"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.4, duration: 0.3 }}
-              whileHover={{ scale: 1.03 }}
-              whileTap={{ scale: 0.97 }}
-            >
-              {isTipLoading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="w-3.5 h-3.5" />
+            {/* ── Financial Literacy Overlay ────────────────────────────────── */}
+            <AnimatePresence>
+              {financialPhase !== "task" && (
+                <motion.div
+                  className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-background/[0.97] backdrop-blur-md px-6 py-8 overflow-y-auto"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  {/* Choice menu */}
+                  {financialPhase === "financial-choice" && (
+                    <motion.div
+                      className="w-full max-w-sm flex flex-col gap-3"
+                      initial={{ y: 20, opacity: 0 }}
+                      animate={{ y: 0, opacity: 1 }}
+                      transition={{ delay: 0.15 }}
+                    >
+                      <div className="text-center mb-2">
+                        <p className="text-3xl font-extrabold text-ig-orange mb-0.5">
+                          +{lastCoinSOL.toFixed(3)} SOL
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Wallet: {availableSOL.toFixed(3)} SOL available
+                        </p>
+                        <p className="text-base font-semibold text-foreground mt-1">
+                          What will you do with this coin?
+                        </p>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          Tap to see what each option means
+                        </p>
+                      </div>
+
+                      {/* HODL — always shown */}
+                      <button
+                        onClick={() => handleFinancialChoice("do-nothing")}
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-ig-elevated hover:border-blue-400 transition-all text-left"
+                      >
+                        <div className="p-2.5 rounded-xl bg-blue-500/10 shrink-0">
+                          <Wallet className="w-5 h-5 text-blue-400" />
+                        </div>
+                        <div>
+                          <p className="font-semibold text-sm text-foreground">HODL (Do Nothing)</p>
+                          <p className="text-xs text-muted-foreground">Keep it in your app wallet</p>
+                        </div>
+                      </button>
+
+                      {/* Withdraw — always shown */}
+                      <button
+                        onClick={() => handleFinancialChoice("withdraw")}
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-ig-elevated hover:border-orange-400 transition-all text-left"
+                      >
+                        <div className="p-2.5 rounded-xl bg-orange-500/10 shrink-0">
+                          <ArrowDown className="w-5 h-5 text-orange-400" />
+                        </div>
+                        <div>
+                          <p className="font-semibold text-sm text-foreground">Withdraw</p>
+                          <p className="text-xs text-muted-foreground">Cash out to your Phantom wallet</p>
+                        </div>
+                      </button>
+
+                      {/* Low-Risk — unlocked when availableSOL ≥ 0.002 */}
+                      {availableSOL >= 0.002 && (
+                        <button
+                          onClick={() => handleFinancialChoice("low-risk")}
+                          className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-ig-elevated hover:border-green-400 transition-all text-left"
+                        >
+                          <div className="p-2.5 rounded-xl bg-green-500/10 shrink-0">
+                            <TrendingUp className="w-5 h-5 text-green-400" />
+                          </div>
+                          <div>
+                            <p className="font-semibold text-sm text-foreground">
+                              Low-Risk Investment
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              Stablecoin yield · 4–8% APY
+                            </p>
+                          </div>
+                        </button>
+                      )}
+
+                      {/* High-Risk — unlocked when availableSOL ≥ 0.003 */}
+                      {availableSOL >= 0.003 && (
+                        <button
+                          onClick={() => handleFinancialChoice("high-risk")}
+                          className="flex items-center gap-4 p-4 rounded-2xl border border-border bg-ig-elevated hover:border-purple-400 transition-all text-left"
+                        >
+                          <div className="p-2.5 rounded-xl bg-purple-500/10 shrink-0">
+                            <Zap className="w-5 h-5 text-purple-400" />
+                          </div>
+                          <div>
+                            <p className="font-semibold text-sm text-foreground">
+                              High-Risk Investment
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              DeFi / SOL staking · 15–40% APY
+                            </p>
+                          </div>
+                        </button>
+                      )}
+
+                      {availableSOL < 0.002 && (
+                        <p className="text-center text-xs text-muted-foreground/60 pt-1">
+                          HODL more SOL to unlock investment options 🔒
+                        </p>
+                      )}
+                    </motion.div>
+                  )}
+
+                  {/* Educational result — user closes manually */}
+                  {financialPhase === "financial-result" && financialChoiceMessage && (
+                    <motion.div
+                      className="w-full max-w-sm flex flex-col items-center gap-5"
+                      initial={{ scale: 0.9, opacity: 0 }}
+                      animate={{ scale: 1, opacity: 1 }}
+                      transition={{ duration: 0.3 }}
+                    >
+                      <div className="p-4 rounded-full bg-ig-orange/10">
+                        <Sparkles className="w-10 h-10 text-ig-orange" />
+                      </div>
+                      <p className="text-foreground font-medium text-sm leading-relaxed text-center">
+                        {financialChoiceMessage}
+                      </p>
+                      <button
+                        onClick={handleCloseFinancialResult}
+                        className="w-full py-3 rounded-2xl font-semibold text-sm bg-ig-orange text-white hover:opacity-90 transition-opacity"
+                      >
+                        Got it! Continue →
+                      </button>
+                    </motion.div>
+                  )}
+                </motion.div>
               )}
-              Ask Vaultic for advice
-            </motion.button>
+            </AnimatePresence>
           </motion.div>
         )}
       </AnimatePresence>
