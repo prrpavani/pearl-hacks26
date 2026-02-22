@@ -19,7 +19,7 @@ load_dotenv()
 # Gemini setup
 # ---------------------------------------------------------------------------
 genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
-_gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+_gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 # ---------------------------------------------------------------------------
 # ElevenLabs setup
