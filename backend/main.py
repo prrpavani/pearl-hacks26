@@ -39,7 +39,12 @@ PAYOUT_SOL = PAYOUT_LAMPORTS / LAMPORTS_PER_SOL
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await setup_indexes()  # create indexes on startup (idempotent)
+    try:
+        await setup_indexes()  # create indexes on startup (idempotent)
+    except Exception as exc:
+        # Log but don't crash — indexes will be created on first successful connection
+        import logging
+        logging.warning(f"MongoDB index setup failed (will retry on first request): {exc}")
     yield
     await close_client()   # clean up Mongo connection on shutdown
 

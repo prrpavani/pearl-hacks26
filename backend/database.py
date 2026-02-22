@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MONGO_URI = os.getenv("MONGODB_URI")
+print(MONGO_URI)
 DB_NAME = "pearlhacks"
 TASKS_COLLECTION = "tasks"
 SUBMISSIONS_COLLECTION = "task_submissions"
