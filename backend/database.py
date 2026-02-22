@@ -28,13 +28,22 @@ async def create_tenant(tenant_name: str, threshold: int = 5):
     }
     await get_tenants_col().insert_one(doc)
 
-async def upload_image_to_tenant(tenant_name: str, image_url: str):
+async def upload_image_to_tenant(
+    tenant_name: str,
+    image_url: str,
+    ground_truth: str | None = None,
+    wrong_options: list[str] | None = None,
+):
     import logging
-    image_obj = {
+    image_obj: dict = {
         "image_url": image_url,
         "votes": {},
-        "verified_label": None
+        "verified_label": None,
     }
+    if ground_truth:
+        image_obj["ground_truth"] = ground_truth
+    if wrong_options:
+        image_obj["wrong_options"] = wrong_options
     result = await get_tenants_col().update_one(
         {"tenant_name": tenant_name},
         {"$push": {"uploaded_images": image_obj}}
@@ -42,6 +51,15 @@ async def upload_image_to_tenant(tenant_name: str, image_url: str):
     logging.info(f"Upload image for tenant '{tenant_name}': matched={result.matched_count}, modified={result.modified_count}, image_url={image_url}")
     if result.matched_count == 0:
         raise ValueError(f"Tenant '{tenant_name}' not found. No image uploaded.")
+
+
+async def reset_image_votes(tenant_name: str, image_url: str) -> bool:
+    """Reset votes and verified status for an image. Returns True if found."""
+    result = await get_tenants_col().update_one(
+        {"tenant_name": tenant_name, "uploaded_images.image_url": image_url},
+        {"$set": {"uploaded_images.$.votes": {}, "uploaded_images.$.verified_label": None}},
+    )
+    return result.matched_count > 0
 
 async def seed_static_images(tenant_name: str, images: list[dict]) -> int:
     """

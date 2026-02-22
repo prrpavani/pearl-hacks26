@@ -30,6 +30,7 @@ from database import (
     get_verified_col,
     seed_static_images,
     remove_stale_images,
+    reset_image_votes,
 )
 
 from solana_service import send_devnet_sol, PAYOUT_LAMPORTS, LAMPORTS_PER_SOL
@@ -66,9 +67,12 @@ async def lifespan(app: FastAPI):
         added = await seed_static_images("Instagram", STATIC_IMAGE_LABELS)
         if added:
             logging.info(f"Seeded {added} static image(s) into 'Instagram' tenant")
-        # Remove any images no longer present in uploads/
-        valid_filenames = [item["filename"] for item in STATIC_IMAGE_LABELS]
-        removed = await remove_stale_images("Instagram", valid_filenames)
+        # Remove MongoDB entries for any images no longer physically on disk
+        # (covers both static images deleted from uploads/ and admin-uploaded ones)
+        _up = os.path.join(os.path.dirname(__file__), "uploads")
+        os.makedirs(_up, exist_ok=True)
+        disk_filenames = [f for f in os.listdir(_up) if os.path.isfile(os.path.join(_up, f))]
+        removed = await remove_stale_images("Instagram", disk_filenames)
         if removed:
             logging.info(f"Removed {removed} stale image(s) from 'Instagram' tenant")
     except Exception as exc:
@@ -351,3 +355,116 @@ async def get_tip():
 async def get_tip_text_only():
     tip_text = await get_financial_tip_text()
     return {"tip": tip_text}
+
+
+# ---------------------------------------------------------------------------
+# Admin APIs
+# ---------------------------------------------------------------------------
+
+@app.post("/admin/upload")
+async def admin_upload_image(
+    tenant_name: str = Form(...),
+    file: UploadFile = File(...),
+    ground_truth: str = Form(...),
+    wrong_option_1: str = Form(...),
+    wrong_option_2: str = Form(...),
+    wrong_option_3: str = Form(...),
+):
+    """Upload a single labeled image for the labeling workflow."""
+    filename = file.filename or "image"
+    save_path = os.path.join(UPLOAD_DIR, filename)
+    base, ext = os.path.splitext(filename)
+    i = 1
+    while os.path.exists(save_path):
+        filename = f"{base}_{i}{ext}"
+        save_path = os.path.join(UPLOAD_DIR, filename)
+        i += 1
+    with open(save_path, "wb") as f:
+        f.write(await file.read())
+
+    image_url = f"/uploads/{filename}"
+    wrong_options = [wrong_option_1.strip(), wrong_option_2.strip(), wrong_option_3.strip()]
+    await upload_image_to_tenant(
+        tenant_name, image_url,
+        ground_truth=ground_truth.strip(),
+        wrong_options=wrong_options,
+    )
+    return {
+        "status": "uploaded",
+        "image_url": image_url,
+        "ground_truth": ground_truth.strip(),
+        "wrong_options": wrong_options,
+    }
+
+
+@app.get("/admin/images")
+async def admin_get_images(tenant_name: str = "Instagram"):
+    """Return all images for a tenant with full vote data."""
+    tenant = await get_tenants_col().find_one({"tenant_name": tenant_name})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    threshold = tenant.get("threshold", 5)
+    images = []
+    for img in tenant.get("uploaded_images", []):
+        images.append({
+            "image_url": img["image_url"],
+            "ground_truth": img.get("ground_truth"),
+            "wrong_options": img.get("wrong_options", []),
+            "votes": img.get("votes", {}),
+            "verified_label": img.get("verified_label"),
+            "total_votes": sum(img.get("votes", {}).values()),
+            "threshold": threshold,
+        })
+    return {"images": images, "threshold": threshold}
+
+
+@app.post("/admin/simulate-votes")
+async def admin_simulate_votes(
+    tenant_name: str = Form(...),
+    image_url: str = Form(...),
+    count: int = Form(5),
+):
+    """Add N simulated crowd votes to an image (60% weighted toward ground truth)."""
+    import random
+
+    tenant = await get_tenants_col().find_one({"tenant_name": tenant_name})
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    img = next((i for i in tenant["uploaded_images"] if i["image_url"] == image_url), None)
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found in tenant")
+
+    ground_truth = img.get("ground_truth")
+    wrong_options = img.get("wrong_options", [])
+    all_options = ([ground_truth] if ground_truth else []) + wrong_options
+    if not all_options:
+        raise HTTPException(status_code=400, detail="Image has no labels configured")
+
+    weights = [
+        0.6 if opt == ground_truth else (0.4 / max(len(wrong_options), 1))
+        for opt in all_options
+    ]
+
+    already_verified = img.get("verified_label") is not None
+    for _ in range(count):
+        chosen = random.choices(all_options, weights=weights, k=1)[0]
+        await vote_on_image(tenant_name, image_url, chosen)
+
+    verified_label = img.get("verified_label")
+    if not already_verified:
+        verified_label = await verify_image_if_threshold(tenant_name, image_url)
+
+    return {"status": "simulated", "votes_added": count, "verified_label": verified_label}
+
+
+@app.post("/admin/reset-votes")
+async def admin_reset_votes(
+    tenant_name: str = Form(...),
+    image_url: str = Form(...),
+):
+    """Reset votes and verified status so an image re-appears in the Earn tab."""
+    found = await reset_image_votes(tenant_name, image_url)
+    if not found:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return {"status": "reset", "image_url": image_url}
